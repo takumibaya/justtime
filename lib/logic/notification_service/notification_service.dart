@@ -18,28 +18,28 @@ const String kActionGood = 'action_good';
 const String kActionEarlier = 'action_earlier';
 const String kActionLater = 'action_later';
 
-/// 共通のAndroidアクションボタン群。
-/// アプリを開かず直接フィードバックを保存するため、
-/// showsUserInterface=false, cancelNotification=true。
+const String kPayloadDaily = 'daily';
+const String kPayloadTest = 'test';
+
 List<AndroidNotificationAction> feedbackActions() {
   return const [
     AndroidNotificationAction(
       kActionGood,
-      'ちょうどいい',
+      'ありがとう',
       showsUserInterface: false,
       cancelNotification: true,
     ),
     AndroidNotificationAction(
       kActionEarlier,
-      'もう少し早く',
-      showsUserInterface: false,
-      cancelNotification: true,
+      'なんで今頃',
+      showsUserInterface: true,
+      cancelNotification: false,
     ),
     AndroidNotificationAction(
       kActionLater,
-      'もう少し後',
-      showsUserInterface: false,
-      cancelNotification: true,
+      'まだまだ頑張れるよ',
+      showsUserInterface: true,
+      cancelNotification: false,
     ),
   ];
 }
@@ -60,12 +60,15 @@ int? _actionIdToFeedbackIndex(String? actionId) {
   }
 }
 
-/// フィードバック種別に応じて、翌日の通知時刻を ±30分 調整。
-/// （NotificationTimeService.calcNextTime のロジックをbgから呼べるよう複製）
+/// フィードバック種別に応じて、翌日の通知時刻を ±30分 調整。workStart/sleepStart で範囲内に丸める。
 ({int hour, int minute}) _adjustNextNotifyTime({
   required int currentHour,
   required int currentMinute,
   required int feedbackIndex,
+  int? workStartHour,
+  int? workStartMinute,
+  int? sleepStartHour,
+  int? sleepStartMinute,
 }) {
   int totalMinutes = currentHour * 60 + currentMinute;
   if (feedbackIndex == FeedbackType.tooEarly.index) {
@@ -73,8 +76,21 @@ int? _actionIdToFeedbackIndex(String? actionId) {
   } else if (feedbackIndex == FeedbackType.tooLate.index) {
     totalMinutes -= 30;
   }
-  // 24h 内に正規化
   totalMinutes = ((totalMinutes % (24 * 60)) + (24 * 60)) % (24 * 60);
+
+  if (workStartHour != null && workStartMinute != null) {
+    final workStartTotal = workStartHour * 60 + workStartMinute;
+    if (totalMinutes < workStartTotal) {
+      totalMinutes = workStartTotal;
+    }
+  }
+  if (sleepStartHour != null && sleepStartMinute != null) {
+    final sleepStartTotal = sleepStartHour * 60 + sleepStartMinute;
+    if (totalMinutes >= sleepStartTotal) {
+      totalMinutes = sleepStartTotal;
+    }
+  }
+
   return (hour: totalMinutes ~/ 60, minute: totalMinutes % 60);
 }
 
@@ -100,6 +116,11 @@ Future<void> notificationActionHandler(NotificationResponse response) async {
     final feedbackIndex = _actionIdToFeedbackIndex(response.actionId);
     if (feedbackIndex == null) {
       await _bgDebugLog('Unknown actionId, skip');
+      return;
+    }
+
+    if (response.actionId != kActionGood) {
+      await _bgDebugLog('Non-good action, defer to app foreground');
       return;
     }
 
@@ -145,11 +166,32 @@ Future<void> notificationActionHandler(NotificationResponse response) async {
         );
       }
 
+      int? workStartHour;
+      int? workStartMinute;
+      int? sleepStartHour;
+      int? sleepStartMinute;
+      try {
+        final settingRows = await db.query('user_setting', limit: 1);
+        if (settingRows.isNotEmpty) {
+          final row = settingRows.first;
+          workStartHour = row['work_start_hour'] as int?;
+          workStartMinute = row['work_start_minute'] as int?;
+          sleepStartHour = row['sleep_start_hour'] as int?;
+          sleepStartMinute = row['sleep_start_minute'] as int?;
+        }
+      } catch (e) {
+        await _bgDebugLog('user_setting read failed: $e');
+      }
+
       // 明日の通知時刻を算出して保存
       final next = _adjustNextNotifyTime(
         currentHour: currentHour,
         currentMinute: currentMinute,
         feedbackIndex: feedbackIndex,
+        workStartHour: workStartHour,
+        workStartMinute: workStartMinute,
+        sleepStartHour: sleepStartHour,
+        sleepStartMinute: sleepStartMinute,
       );
       await db.insert('daily_state', {
         'date': tomorrowKey,
@@ -197,7 +239,7 @@ Future<void> notificationActionHandler(NotificationResponse response) async {
         await plugin.zonedSchedule(
           0,
           '今日もお疲れさまでした',
-          'フィードバックを入力しましょう',
+          '今日の声かけ、いかがでしたか？',
           fire,
           NotificationDetails(
             android: AndroidNotificationDetails(
@@ -234,6 +276,9 @@ class NotificationService {
 
   bool _initialized = false;
 
+  static VoidCallback? onFeedbackRequested;
+  static bool pendingFeedback = false;
+
   NotificationService(this.logRepository);
 
   Future<void> init() async {
@@ -251,9 +296,17 @@ class NotificationService {
         DarwinNotificationCategory(
           'daily_feedback',
           actions: [
-            DarwinNotificationAction.plain(kActionGood, 'ちょうどいい'),
-            DarwinNotificationAction.plain(kActionEarlier, 'もう少し早く'),
-            DarwinNotificationAction.plain(kActionLater, 'もう少し後'),
+            DarwinNotificationAction.plain(kActionGood, 'ありがとう'),
+            DarwinNotificationAction.plain(
+              kActionEarlier,
+              'なんで今頃',
+              options: {DarwinNotificationActionOption.foreground},
+            ),
+            DarwinNotificationAction.plain(
+              kActionLater,
+              'まだまだ頑張れるよ',
+              options: {DarwinNotificationActionOption.foreground},
+            ),
           ],
         ),
       ],
@@ -301,6 +354,12 @@ class NotificationService {
             'actionId=${response.actionId ?? ''}',
       ),
     );
+
+    final isGoodAction = response.actionId == kActionGood;
+    if (!isGoodAction) {
+      pendingFeedback = true;
+      onFeedbackRequested?.call();
+    }
   }
 
   NotificationScheduler get scheduler =>
@@ -324,6 +383,10 @@ class NotificationScheduler {
       ),
       iOS: const DarwinNotificationDetails(
         categoryIdentifier: 'daily_feedback',
+        presentAlert: true,
+        presentBanner: true,
+        presentList: true,
+        presentSound: true,
       ),
     );
   }
@@ -347,9 +410,10 @@ class NotificationScheduler {
     await _plugin.zonedSchedule(
       0,
       '今日もお疲れさまでした',
-      'フィードバックを入力しましょう',
+      '今日の声かけ、いかがでしたか？',
       tzDate,
       _detailsWithActions(),
+      payload: kPayloadDaily,
       uiLocalNotificationDateInterpretation:
           UILocalNotificationDateInterpretation.absoluteTime,
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
@@ -386,9 +450,10 @@ class NotificationScheduler {
     await _plugin.zonedSchedule(
       99,
       '[テスト] 今日もお疲れさまでした',
-      'フィードバックを入力しましょう',
+      '今日の声かけ、いかがでしたか？',
       fireAt,
       _detailsWithActions(),
+      payload: kPayloadTest,
       uiLocalNotificationDateInterpretation:
           UILocalNotificationDateInterpretation.absoluteTime,
       androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,

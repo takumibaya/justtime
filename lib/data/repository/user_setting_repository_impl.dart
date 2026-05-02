@@ -37,9 +37,13 @@ class UserSettingRepositoryImpl implements UserSettingRepository {
   Future<void> saveUserSetting(UserSetting setting) async {
     final db = await AppDatabase.database;
 
+    await db.delete('user_setting', where: 'id != ?', whereArgs: [1]);
+
+    final values = setting.toMap();
+    values['id'] = 1;
     await db.insert(
       'user_setting',
-      setting.toMap(),
+      values,
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }

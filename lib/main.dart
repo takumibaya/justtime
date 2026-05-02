@@ -113,6 +113,7 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    NotificationService.onFeedbackRequested = null;
     super.dispose();
   }
 
@@ -134,7 +135,10 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
 
       if (mounted) {
         setState(() {
-          _appState = state;
+          _appState = NotificationService.pendingFeedback
+              ? AppState.waitingFeedback
+              : state;
+          NotificationService.pendingFeedback = false;
         });
       }
     } finally {
@@ -150,8 +154,10 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
     );
 
     notificationService = NotificationService(notificationLogRepository);
+    NotificationService.onFeedbackRequested = _showFeedbackFromNotification;
     final notificationTimeService = NotificationTimeService(
       notificationService,
+      userSettingRepository: userSettingRepository,
     );
 
     initialSetupService = InitialSetupService(
@@ -184,17 +190,34 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
   }
 
   Future<void> _startApp() async {
+    try {
+      await notificationService.init();
+    } catch (e, st) {
+      debugPrint('[NotificationService.init][ERROR] $e\n$st');
+    }
+
     final state = await entryService.onAppStart();
 
     if (mounted) {
       setState(() {
-        _appState = state;
+        _appState = NotificationService.pendingFeedback
+            ? AppState.waitingFeedback
+            : state;
+        NotificationService.pendingFeedback = false;
       });
     }
 
     await userSettingRepository.debugPrintUserSetting();
     await dailyStateRepository.debugPrintAll();
     await notificationLogRepository.debugPrintAll();
+  }
+
+  void _showFeedbackFromNotification() {
+    if (!mounted) return;
+    setState(() {
+      _appState = AppState.waitingFeedback;
+      NotificationService.pendingFeedback = false;
+    });
   }
 
   Future<TimeOfDay?> _loadTodayNotifyTime() async {
@@ -333,8 +356,11 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
       case AppState.waitingFeedback:
         return FeedbackPage(
           onOpenMenu: _handleOpenMenu,
-          onFeedbackSubmitted: (FeedbackType type) async {
-            await feedbackService.submitFeedback(type);
+          onFeedbackSubmitted: (FeedbackType type, int? adjustMinutes) async {
+            await feedbackService.submitFeedback(
+              type,
+              adjustMinutes: adjustMinutes,
+            );
             final state = await feedbackService.completeFeedback();
             if (mounted) {
               setState(() {
